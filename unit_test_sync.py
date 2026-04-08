@@ -6,6 +6,7 @@ and export to CSV for dashboard import (e.g., Looker Studio).
 
 import csv
 import json
+import re
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -16,10 +17,23 @@ import yaml
 # Default GitHub org for repos - modify if your repos use a different org
 DEFAULT_ORG = "CBIIT"
 
+# Branches included in export: main, master, or semver-style names (e.g. 3.6.0, v1.2.3).
+_VERSION_BRANCH = re.compile(r"^v?\d+(\.\d+)+$")
+
+
+def is_allowed_branch(branch: str) -> bool:
+    if not branch or not branch.strip():
+        return False
+    name = branch.strip()
+    if name in ("main", "master"):
+        return True
+    return bool(_VERSION_BRANCH.fullmatch(name))
+
+
 # Paths
 SCRIPT_DIR = Path(__file__).parent
 REPOS_FILE = SCRIPT_DIR / "repositories.yml"
-OUTPUT_CSV = f'${SCRIPT_DIR}/data/unit_test_coverage.csv'
+OUTPUT_CSV = f'{SCRIPT_DIR}/data/unit_test_coverage.csv'
 
 
 def load_repositories() -> list[dict]:
@@ -108,10 +122,14 @@ def main():
         builds = fetch_all_coverage_builds(repo_org, name)
         program = repo.get("program", "") or ""
         project = repo.get("project", "") or ""
+        kept = 0
         for build in builds:
+            if not is_allowed_branch(build.get("branch") or ""):
+                continue
             rows.append(extract_row(name, build, program, project))
+            kept += 1
         if builds:
-            print(f"  Retrieved {len(builds)} builds")
+            print(f"  Retrieved {len(builds)} builds, {kept} on allowed branches")
 
     if not rows:
         print("No coverage data retrieved. Check repo names and org.")
