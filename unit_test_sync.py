@@ -9,9 +9,9 @@ Per repository, only the last build of each calendar month (US Eastern) is kept.
 
 coverage_change is computed per repo as (current covered_percent − previous month's), not from the API.
 
-Also writes project_coverage.csv: one row per project per Eastern calendar month; covered_percent =
-sum(covered_lines) / sum(total_lines) across repos in that project, with project-level coverage_change
-vs the prior month.
+Also writes project_coverage.csv and program_coverage.csv: one row per project / program per Eastern
+calendar month; covered_percent = sum(covered_lines) / sum(total_lines) in that bucket; coverage_change
+is MoM on that ratio.
 """
 
 import csv
@@ -85,6 +85,7 @@ SCRIPT_DIR = Path(__file__).parent
 REPOS_FILE = SCRIPT_DIR / "repositories.yml"
 REPO_COVERAGE_CSV = SCRIPT_DIR / "data" / "repository_coverage.csv"
 PROJECT_COVERAGE_CSV = SCRIPT_DIR / "data" / "project_coverage.csv"
+PROGRAM_COVERAGE_CSV = SCRIPT_DIR / "data" / "program_coverage.csv"
 
 
 def load_repositories() -> list[dict]:
@@ -239,6 +240,62 @@ def build_project_coverage_rows(repo_rows: list[dict]) -> list[dict]:
     return out
 
 
+def build_program_coverage_rows(repo_rows: list[dict]) -> list[dict]:
+    """Roll per-repo rows into one row per (program, US Eastern year-month).
+
+    Same aggregation as project rollup, keyed by program.
+    """
+    eastern = ZoneInfo("America/New_York")
+    groups: dict[tuple[str, int, int], list[dict]] = defaultdict(list)
+    for row in repo_rows:
+        ts = parse_calculated_at(row.get("calculated_at") or "")
+        if ts is None:
+            continue
+        local = ts.astimezone(eastern)
+        prog = row.get("program") or ""
+        groups[(prog, local.year, local.month)].append(row)
+
+    aggregated: list[dict] = []
+    for (prog, y, m), bucket in groups.items():
+        sum_cov = sum(int(row["covered_lines"]) for row in bucket)
+        sum_tot = sum(int(row["total_lines"]) for row in bucket)
+        pct = 0.0 if sum_tot == 0 else round(sum_cov / sum_tot, 4)
+        projects = sorted({(row.get("project") or "") for row in bucket if (row.get("project") or "").strip()})
+        project_str = "; ".join(projects) if projects else ""
+        latest_row = max(
+            bucket,
+            key=lambda r: parse_calculated_at(r.get("calculated_at") or "")
+            or datetime.min.replace(tzinfo=timezone.utc),
+        )
+        aggregated.append(
+            {
+                "program": prog,
+                "project": project_str,
+                "year_month": f"{y:04d}-{m:02d}",
+                "covered_percent": pct,
+                "covered_lines": sum_cov,
+                "total_lines": sum_tot,
+                "repo_count": len(bucket),
+                "calculated_at": latest_row.get("calculated_at", ""),
+                "coverage_change": "",
+            }
+        )
+
+    by_program: dict[str, list[dict]] = defaultdict(list)
+    for row in aggregated:
+        by_program[row["program"]].append(row)
+
+    for plist in by_program.values():
+        plist.sort(key=lambda r: r["year_month"])
+        add_coverage_change_vs_prior_month(plist)
+
+    out: list[dict] = []
+    for program in sorted(by_program.keys()):
+        rows_p = sorted(by_program[program], key=lambda r: r["year_month"], reverse=True)
+        out.extend(rows_p)
+    return out
+
+
 def main():
     repos = load_repositories()
     if not repos:
@@ -293,6 +350,15 @@ def main():
             writer.writeheader()
             writer.writerows(project_rows)
         print(f"Wrote {len(project_rows)} rows to {PROJECT_COVERAGE_CSV}")
+
+    program_rows = build_program_coverage_rows(rows)
+    if program_rows:
+        pfields = list(program_rows[0].keys())
+        with open(PROGRAM_COVERAGE_CSV, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=pfields)
+            writer.writeheader()
+            writer.writerows(program_rows)
+        print(f"Wrote {len(program_rows)} rows to {PROGRAM_COVERAGE_CSV}")
 
 
 if __name__ == "__main__":
