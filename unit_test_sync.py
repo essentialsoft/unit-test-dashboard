@@ -19,7 +19,7 @@ DEFAULT_ORG = "CBIIT"
 # Paths
 SCRIPT_DIR = Path(__file__).parent
 REPOS_FILE = SCRIPT_DIR / "repositories.yml"
-OUTPUT_CSV = SCRIPT_DIR / "unit_test_coverage.csv"
+OUTPUT_CSV = f'${SCRIPT_DIR}/data/unit_test_coverage.csv'
 
 
 def load_repositories() -> list[dict]:
@@ -77,13 +77,11 @@ def extract_row(repo_name: str, build: dict, program: str = "", project: str = "
         "project": project,
         "full_repo": build.get("repo_name") or "",
         "branch": build.get("branch") or "",
-        "covered_percent": round(num(build.get("covered_percent")), 2),
+        # Coveralls reports 0–100; store as 0–1 for dashboard (e.g. 82 -> 0.82).
+        "covered_percent": round(num(build.get("covered_percent")) / 100, 4),
         "covered_lines": num(build.get("covered_lines")),
         "missed_lines": num(build.get("missed_lines")),
-        "relevant_lines": num(build.get("relevant_lines")),
-        "covered_branches": num(build.get("covered_branches")),
-        "missed_branches": num(build.get("missed_branches")),
-        "relevant_branches": num(build.get("relevant_branches")),
+        "total_lines": num(build.get("relevant_lines")),
         "coverage_change": build.get("coverage_change"),
         "commit_sha": build.get("commit_sha", ""),
         "commit_message": (build.get("commit_message", "") or "")[:200],
