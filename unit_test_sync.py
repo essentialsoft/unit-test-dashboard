@@ -6,6 +6,8 @@ and export to CSV for dashboard import (e.g., Looker Studio).
 Only includes builds with calculated_at on or after 2026-01-01 in US Eastern (see MIN_BUILD_CUTOFF).
 
 Per repository, only the last build of each calendar month (US Eastern) is kept.
+
+coverage_change is computed per repo as (current covered_percent − previous month's), not from the API.
 """
 
 import csv
@@ -47,6 +49,8 @@ def parse_calculated_at(raw: str) -> datetime | None:
 
 
 def is_allowed_branch(branch: str) -> bool:
+    # temporarily allow all branches
+    return True
     if not branch or not branch.strip():
         return False
     name = branch.strip()
@@ -146,12 +150,31 @@ def extract_row(repo_name: str, build: dict, program: str = "", project: str = "
         "covered_lines": num(build.get("covered_lines")),
         "missed_lines": num(build.get("missed_lines")),
         "total_lines": num(build.get("relevant_lines")),
-        "coverage_change": build.get("coverage_change"),
+        "coverage_change": "",
         "commit_sha": build.get("commit_sha", ""),
         "commit_message": (build.get("commit_message", "") or "")[:200],
         "calculated_at": build.get("calculated_at", ""),
         "url": build.get("url", ""),
     }
+
+
+def add_coverage_change_vs_prior_month(rows_oldest_first: list[dict]) -> None:
+    """Set coverage_change on each row: covered_percent minus previous month (same 0–1 scale). First row -> ''."""
+    prev: float | None = None
+    for row in rows_oldest_first:
+        pct = float(row["covered_percent"])
+        if prev is None:
+            row["coverage_change"] = ""
+        else:
+            row["coverage_change"] = round(pct - prev, 4)
+        prev = pct
+
+
+def _sort_key_calculated_at(record: dict) -> datetime:
+    ts = parse_calculated_at(record.get("calculated_at") or "")
+    if ts is not None:
+        return ts
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def main():
@@ -174,8 +197,11 @@ def main():
         project = repo.get("project", "") or ""
         allowed = [b for b in builds if is_allowed_branch(b.get("branch") or "")]
         monthly = select_last_build_each_month(allowed)
-        for build in monthly:
-            rows.append(extract_row(name, build, program, project))
+        chrono = sorted(monthly, key=_sort_key_calculated_at)
+        repo_rows = [extract_row(name, b, program, project) for b in chrono]
+        add_coverage_change_vs_prior_month(repo_rows)
+        repo_rows.sort(key=_sort_key_calculated_at, reverse=True)
+        rows.extend(repo_rows)
         if builds:
             print(
                 f"  Retrieved {len(builds)} builds, {len(allowed)} on allowed branches, "
