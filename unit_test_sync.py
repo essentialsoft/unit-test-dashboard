@@ -2,6 +2,10 @@
 """
 Retrieve unit test coverage data from Coveralls API for all repos in repositories.yml
 and export to CSV for dashboard import (e.g., Looker Studio).
+
+Only includes builds with calculated_at on or after 2026-01-01 in US Eastern (see MIN_BUILD_CUTOFF).
+
+Per repository, only the last build of each calendar month (US Eastern) is kept.
 """
 
 import csv
@@ -9,7 +13,9 @@ import json
 import re
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -17,8 +23,27 @@ import yaml
 # Default GitHub org for repos - modify if your repos use a different org
 DEFAULT_ORG = "CBIIT"
 
+# Only builds on or after midnight at the start of this calendar date (US Eastern) are exported.
+MIN_BUILD_CUTOFF = datetime(2026, 1, 1, tzinfo=ZoneInfo("America/New_York"))
+
 # Branches included in export: main, master, or semver-style names (e.g. 3.6.0, v1.2.3).
 _VERSION_BRANCH = re.compile(r"^v?\d+(\.\d+)+$")
+
+
+def parse_calculated_at(raw: str) -> datetime | None:
+    """Parse Coveralls calculated_at (ISO 8601); return None if missing or invalid."""
+    if not raw or not str(raw).strip():
+        return None
+    s = str(raw).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def is_allowed_branch(branch: str) -> bool:
@@ -28,6 +53,22 @@ def is_allowed_branch(branch: str) -> bool:
     if name in ("main", "master"):
         return True
     return bool(_VERSION_BRANCH.fullmatch(name))
+
+
+def select_last_build_each_month(builds: list[dict]) -> list[dict]:
+    """One build per US Eastern calendar month: the latest by calculated_at within that month."""
+    tz = ZoneInfo("America/New_York")
+    best: dict[tuple[int, int], tuple[dict, datetime]] = {}
+    for build in builds:
+        ts = parse_calculated_at(build.get("calculated_at") or "")
+        if ts is None:
+            continue
+        local = ts.astimezone(tz)
+        key = (local.year, local.month)
+        if key not in best or ts > best[key][1]:
+            best[key] = (build, ts)
+    ordered = sorted(best.values(), key=lambda x: x[1], reverse=True)
+    return [b for b, _ in ordered]
 
 
 # Paths
@@ -61,7 +102,10 @@ def fetch_coverage_page(org: str, repo_name: str, page: int = 1) -> dict | None:
 
 
 def fetch_all_coverage_builds(org: str, repo_name: str) -> list[dict]:
-    """Fetch entire build history for a repo (all pages). Returns list of build dicts."""
+    """Fetch build history for a repo (paginated), stopping once builds are older than MIN_BUILD_CUTOFF.
+
+    Coveralls returns builds newest-first; we skip further pages after the first build before the cutoff.
+    """
     builds = []
     page = 1
     while True:
@@ -71,7 +115,13 @@ def fetch_all_coverage_builds(org: str, repo_name: str) -> list[dict]:
         page_builds = data.get("builds", [])
         if not page_builds:
             break
-        builds.extend(page_builds)
+        for build in page_builds:
+            ts = parse_calculated_at(build.get("calculated_at") or "")
+            if ts is None:
+                continue
+            if ts < MIN_BUILD_CUTOFF:
+                return builds
+            builds.append(build)
         total_pages = data.get("pages", 1)
         if page >= total_pages:
             break
@@ -122,14 +172,15 @@ def main():
         builds = fetch_all_coverage_builds(repo_org, name)
         program = repo.get("program", "") or ""
         project = repo.get("project", "") or ""
-        kept = 0
-        for build in builds:
-            if not is_allowed_branch(build.get("branch") or ""):
-                continue
+        allowed = [b for b in builds if is_allowed_branch(b.get("branch") or "")]
+        monthly = select_last_build_each_month(allowed)
+        for build in monthly:
             rows.append(extract_row(name, build, program, project))
-            kept += 1
         if builds:
-            print(f"  Retrieved {len(builds)} builds, {kept} on allowed branches")
+            print(
+                f"  Retrieved {len(builds)} builds, {len(allowed)} on allowed branches, "
+                f"{len(monthly)} end-of-month snapshot(s)"
+            )
 
     if not rows:
         print("No coverage data retrieved. Check repo names and org.")
