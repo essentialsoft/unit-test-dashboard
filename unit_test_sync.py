@@ -78,7 +78,7 @@ def select_last_build_each_month(builds: list[dict]) -> list[dict]:
 # Paths
 SCRIPT_DIR = Path(__file__).parent
 REPOS_FILE = SCRIPT_DIR / "repositories.yml"
-OUTPUT_CSV = f'{SCRIPT_DIR}/data/unit_test_coverage.csv'
+REPO_COVERAGE_CSV = f'{SCRIPT_DIR}/data/repository_coverage.csv'
 
 
 def load_repositories() -> list[dict]:
@@ -147,10 +147,10 @@ def extract_row(repo_name: str, build: dict, program: str = "", project: str = "
         "branch": build.get("branch") or "",
         # Coveralls reports 0–100; store as 0–1 for dashboard (e.g. 82 -> 0.82).
         "covered_percent": round(num(build.get("covered_percent")) / 100, 4),
+        "coverage_change": "",
         "covered_lines": num(build.get("covered_lines")),
         "missed_lines": num(build.get("missed_lines")),
         "total_lines": num(build.get("relevant_lines")),
-        "coverage_change": "",
         "commit_sha": build.get("commit_sha", ""),
         "commit_message": (build.get("commit_message", "") or "")[:200],
         "calculated_at": build.get("calculated_at", ""),
@@ -214,7 +214,7 @@ def main():
 
     # Write CSV
     fieldnames = list(rows[0].keys())
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
+    with open(REPO_COVERAGE_CSV, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
