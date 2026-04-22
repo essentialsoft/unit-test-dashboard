@@ -8,7 +8,7 @@ Only includes builds with calculated_at on or after 2026-01-01 in US Eastern (se
 Per repository, only the last build of each calendar month (US Eastern) is kept. Months with no build from
 the first month with data through the current Eastern calendar month are filled by copying the prior month's
 repo row (same metrics; calculated_at = US Eastern end of that month in UTC, or current UTC time if that
-instant is still in the future; year_month is always the filled month).
+instant is still in the future; year_month is always that Eastern month as UTC ISO (month start, Z)).
 
 coverage_change is computed per repo as (current covered_percent − previous month's), not from the API.
 
@@ -16,7 +16,7 @@ Also writes project_coverage.csv and program_coverage.csv: one row per project /
 calendar month; covered_percent = sum(covered_lines) / sum(total_lines) in that bucket; coverage_change
 is MoM on that ratio.
 
-Each output CSV includes collected_at: the run date in YYYY-MM-DD (US Eastern).
+Each output CSV includes collected_at: the run instant in UTC as YYYY-MM-DDTHH:MM:SSZ (ISO 8601).
 
 If data/repository_coverage.csv already exists, the script re-reads it. When the file's latest month for a
 repo is the current Eastern month, only that month's builds are requested from the API. When the latest month
@@ -53,11 +53,22 @@ def eastern_month_start(y: int, m: int) -> datetime:
     return datetime(y, m, 1, 0, 0, 0, 0, tzinfo=_EASTERN)
 
 
+def eastern_year_month_to_iso_utc_z(y: int, m: int) -> str:
+    """US Eastern calendar month label: first instant of that month, as UTC YYYY-MM-DDTHH:MM:SSZ."""
+    return eastern_month_start(y, m).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def parse_year_month_ym(s: str) -> tuple[int, int] | None:
-    """Parse YYYY-MM from a CSV year_month value."""
+    """Parse CSV year_month to US Eastern (year, month): ISO UTC (…Z) or legacy YYYY-MM."""
     if not s or not str(s).strip():
         return None
     raw = str(s).strip()
+    if "T" in raw:
+        ts = parse_calculated_at(raw)
+        if ts is None:
+            return None
+        local = ts.astimezone(_EASTERN)
+        return (local.year, local.month)
     if len(raw) < 7 or raw[4] != "-":
         return None
     try:
@@ -67,6 +78,22 @@ def parse_year_month_ym(s: str) -> tuple[int, int] | None:
     if not (1 <= mo <= 12):
         return None
     return (y, mo)
+
+
+def _year_month_sort_key(row: dict) -> tuple[int, int]:
+    ym = parse_year_month_ym(row.get("year_month") or "")
+    return ym if ym is not None else (0, 0)
+
+
+def normalize_stored_year_month(row: dict) -> None:
+    """Set year_month to canonical UTC ISO at US Eastern month start (legacy YYYY-MM or any parseable value)."""
+    raw = (row.get("year_month") or "").strip()
+    if not raw:
+        return
+    ym = parse_year_month_ym(raw)
+    if ym is None:
+        return
+    row["year_month"] = eastern_year_month_to_iso_utc_z(ym[0], ym[1])
 
 
 def current_eastern_year_month() -> tuple[int, int]:
@@ -96,7 +123,10 @@ def _max_year_month_for_rows(rows: list[dict]) -> tuple[int, int] | None:
 
 
 def load_existing_repository_rows(path: Path) -> dict[str, list[dict]]:
-    """Load prior repository_coverage.csv rows, keyed by repo name. Missing file -> empty."""
+    """Load prior repository_coverage.csv rows, keyed by repo name. Missing file -> empty.
+
+    year_month is normalized to canonical UTC ISO (Eastern month start) so legacy YYYY-MM is upgraded.
+    """
     if not path.is_file():
         return {}
     with open(path, newline="", encoding="utf-8") as f:
@@ -106,7 +136,9 @@ def load_existing_repository_rows(path: Path) -> dict[str, list[dict]]:
             name = (row.get("repo_name") or "").strip()
             if not name:
                 continue
-            by_repo[name].append(dict(row))
+            out = dict(row)
+            normalize_stored_year_month(out)
+            by_repo[name].append(out)
     return dict(by_repo)
 
 
@@ -139,7 +171,7 @@ def refresh_window_for_repo(
 def existing_rows_before_month(
     existing: list[dict], first_fetched_ym: tuple[int, int]
 ) -> list[dict]:
-    """Rows to keep as-is: US Eastern YYYY-MM strictly before the first month re-fetched from the API."""
+    """Rows to keep as-is: year_month bucket strictly before the first month re-fetched from the API."""
     if not existing:
         return []
     y0, m0 = first_fetched_ym
@@ -291,7 +323,7 @@ def extract_row(repo_name: str, build: dict, program: str = "", project: str = "
         "project": project,
         "full_repo": build.get("repo_name") or "",
         "branch": build.get("branch") or "",
-        # Set from calculated_at after gap-fill (US Eastern YYYY-MM).
+        # Set from calculated_at after gap-fill (US Eastern month as UTC ISO …Z).
         "year_month": "",
         # Coveralls reports 0–100; store as 0–1 for dashboard (e.g. 82 -> 0.82).
         "covered_percent": round(num(build.get("covered_percent")) / 100, 4),
@@ -323,7 +355,7 @@ def fill_repo_monthly_gaps(repo_rows: list[dict]) -> list[dict]:
 
     Range is from the earliest month with data through the later of (last month with data, current Eastern month).
     Synthetic rows use calculated_at = end of that month (US Eastern) as UTC, unless that time is still in the
-    future, in which case use current UTC time. year_month is always set to the month being filled.
+    future, in which case use current UTC time. year_month is always that month as UTC ISO at Eastern month start.
     Returns rows oldest-first (by calculated_at for ordering).
     """
     eastern = ZoneInfo("America/New_York")
@@ -376,7 +408,7 @@ def fill_repo_monthly_gaps(repo_rows: list[dict]) -> list[dict]:
                 synth["calculated_at"] = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
             else:
                 synth["calculated_at"] = at_end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-            synth["year_month"] = f"{y:04d}-{m:02d}"
+            synth["year_month"] = eastern_year_month_to_iso_utc_z(y, m)
             prev_row = synth
             filled.append(synth)
         cur = next_ym(cur)
@@ -385,7 +417,7 @@ def fill_repo_monthly_gaps(repo_rows: list[dict]) -> list[dict]:
 
 
 def set_repo_row_year_month(row: dict) -> None:
-    """US Eastern calendar month as YYYY-MM from calculated_at (gap-filled rows already set year_month)."""
+    """US Eastern calendar month as UTC ISO at month start from calculated_at (gap-filled rows already set)."""
     if (row.get("year_month") or "").strip():
         return
     ts = parse_calculated_at(row.get("calculated_at") or "")
@@ -393,7 +425,7 @@ def set_repo_row_year_month(row: dict) -> None:
         row["year_month"] = ""
         return
     local = ts.astimezone(ZoneInfo("America/New_York"))
-    row["year_month"] = f"{local.year:04d}-{local.month:02d}"
+    row["year_month"] = eastern_year_month_to_iso_utc_z(local.year, local.month)
 
 
 def _sort_key_calculated_at(record: dict) -> datetime:
@@ -403,22 +435,16 @@ def _sort_key_calculated_at(record: dict) -> datetime:
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def _repo_row_newest_first_key(row: dict) -> tuple[datetime, str]:
+def _repo_row_newest_first_key(row: dict) -> tuple[datetime, tuple[int, int]]:
     """Stable newest-first: tie-break synthetic rows that share the same calculated_at (now)."""
-    return (_sort_key_calculated_at(row), row.get("year_month") or "")
+    return (_sort_key_calculated_at(row), _year_month_sort_key(row))
 
 
 def _repo_row_group_year_month(row: dict) -> tuple[int, int] | None:
     """(year, month) for rollups: use repo year_month when set, else US Eastern from calculated_at."""
-    raw = (row.get("year_month") or "").strip()
-    if raw and len(raw) >= 7 and raw[4] == "-":
-        try:
-            y = int(raw[:4])
-            m = int(raw[5:7])
-            if 1 <= m <= 12:
-                return (y, m)
-        except ValueError:
-            pass
+    ym = parse_year_month_ym((row.get("year_month") or "").strip())
+    if ym is not None:
+        return ym
     ts = parse_calculated_at(row.get("calculated_at") or "")
     if ts is None:
         return None
@@ -456,7 +482,7 @@ def build_project_coverage_rows(repo_rows: list[dict]) -> list[dict]:
             {
                 "program": program_str,
                 "project": proj,
-                "year_month": f"{y:04d}-{m:02d}",
+                "year_month": eastern_year_month_to_iso_utc_z(y, m),
                 "covered_percent": pct,
                 "covered_lines": sum_cov,
                 "total_lines": sum_tot,
@@ -471,12 +497,12 @@ def build_project_coverage_rows(repo_rows: list[dict]) -> list[dict]:
         by_project[row["project"]].append(row)
 
     for plist in by_project.values():
-        plist.sort(key=lambda r: r["year_month"])
+        plist.sort(key=_year_month_sort_key)
         add_coverage_change_vs_prior_month(plist)
 
     out: list[dict] = []
     for project in sorted(by_project.keys()):
-        rows_p = sorted(by_project[project], key=lambda r: r["year_month"], reverse=True)
+        rows_p = sorted(by_project[project], key=_year_month_sort_key, reverse=True)
         out.extend(rows_p)
     return out
 
@@ -511,7 +537,7 @@ def build_program_coverage_rows(repo_rows: list[dict]) -> list[dict]:
             {
                 "program": prog,
                 "project": project_str,
-                "year_month": f"{y:04d}-{m:02d}",
+                "year_month": eastern_year_month_to_iso_utc_z(y, m),
                 "covered_percent": pct,
                 "covered_lines": sum_cov,
                 "total_lines": sum_tot,
@@ -526,12 +552,12 @@ def build_program_coverage_rows(repo_rows: list[dict]) -> list[dict]:
         by_program[row["program"]].append(row)
 
     for plist in by_program.values():
-        plist.sort(key=lambda r: r["year_month"])
+        plist.sort(key=_year_month_sort_key)
         add_coverage_change_vs_prior_month(plist)
 
     out: list[dict] = []
     for program in sorted(by_program.keys()):
-        rows_p = sorted(by_program[program], key=lambda r: r["year_month"], reverse=True)
+        rows_p = sorted(by_program[program], key=_year_month_sort_key, reverse=True)
         out.extend(rows_p)
     return out
 
@@ -586,7 +612,7 @@ def main():
         print("No coverage data retrieved. Check repo names and org.")
         return
 
-    collected_at = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    collected_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     for row in rows:
         row["collected_at"] = collected_at
 
