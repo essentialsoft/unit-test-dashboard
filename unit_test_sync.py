@@ -17,6 +17,10 @@ calendar month; covered_percent = sum(covered_lines) / sum(total_lines) in that 
 is MoM on that ratio.
 
 Each output CSV includes collected_at: the run date in YYYY-MM-DD (US Eastern).
+
+If data/repository_coverage.csv already exists, the script re-reads it. When the file's latest month for a
+repo is the current Eastern month, only that month's builds are requested from the API. When the latest month
+is earlier, the API is queried for that month through the current month; older months are taken from the file.
 """
 
 import calendar
@@ -27,6 +31,7 @@ import re
 from collections import defaultdict
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -39,6 +44,112 @@ DEFAULT_ORG = "CBIIT"
 
 # Only builds on or after midnight at the start of this calendar date (US Eastern) are exported.
 MIN_BUILD_CUTOFF = datetime(2026, 1, 1, tzinfo=ZoneInfo("America/New_York"))
+
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def eastern_month_start(y: int, m: int) -> datetime:
+    """First instant of the given US Eastern calendar month (timezone-aware)."""
+    return datetime(y, m, 1, 0, 0, 0, 0, tzinfo=_EASTERN)
+
+
+def parse_year_month_ym(s: str) -> tuple[int, int] | None:
+    """Parse YYYY-MM from a CSV year_month value."""
+    if not s or not str(s).strip():
+        return None
+    raw = str(s).strip()
+    if len(raw) < 7 or raw[4] != "-":
+        return None
+    try:
+        y, mo = int(raw[:4]), int(raw[5:7])
+    except ValueError:
+        return None
+    if not (1 <= mo <= 12):
+        return None
+    return (y, mo)
+
+
+def current_eastern_year_month() -> tuple[int, int]:
+    n = datetime.now(timezone.utc).astimezone(_EASTERN)
+    return (n.year, n.month)
+
+
+@dataclass(frozen=True)
+class IncrementalWindow:
+    """US Eastern (year, month) range to re-fetch from Coveralls for one repo.
+
+    - oldest: first month to pull from the API (inclusive). None = full backfill to MIN_BUILD_CUTOFF.
+    """
+
+    oldest: tuple[int, int] | None = None
+
+
+def _max_year_month_for_rows(rows: list[dict]) -> tuple[int, int] | None:
+    best: tuple[int, int] | None = None
+    for row in rows:
+        ym = parse_year_month_ym(row.get("year_month") or "")
+        if ym is None:
+            continue
+        if best is None or (ym[0], ym[1]) > (best[0], best[1]):
+            best = ym
+    return best
+
+
+def load_existing_repository_rows(path: Path) -> dict[str, list[dict]]:
+    """Load prior repository_coverage.csv rows, keyed by repo name. Missing file -> empty."""
+    if not path.is_file():
+        return {}
+    with open(path, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        by_repo: dict[str, list[dict]] = defaultdict(list)
+        for row in r:
+            name = (row.get("repo_name") or "").strip()
+            if not name:
+                continue
+            by_repo[name].append(dict(row))
+    return dict(by_repo)
+
+
+def refresh_window_for_repo(
+    existing_for_repo: list[dict] | None,
+) -> tuple[IncrementalWindow, tuple[int, int] | None, tuple[int, int]]:
+    """Decide (fetch window, latest existing YM, current Eastern YM).
+
+    - If the repo has no prior data: full fetch; no months are carried over from file.
+    - If latest month == current month: fetch only the current month; base = all months before current.
+    - If latest < current: fetch from that month through current; base = months before latest.
+    - If latest > current (bad data / skew): only refresh the current month; base = months before current.
+    """
+    now_ym = current_eastern_year_month()
+    ex = existing_for_repo
+    if not ex:
+        return (IncrementalWindow(oldest=None), None, now_ym)
+    em = _max_year_month_for_rows(ex)
+    if em is None:
+        return (IncrementalWindow(oldest=None), None, now_ym)
+    ey, eM = em
+    cy, cM = now_ym
+    if (ey, eM) == (cy, cM):
+        return (IncrementalWindow(oldest=now_ym), em, now_ym)
+    if (ey, eM) < (cy, cM):
+        return (IncrementalWindow(oldest=em), em, now_ym)
+    return (IncrementalWindow(oldest=now_ym), em, now_ym)
+
+
+def existing_rows_before_month(
+    existing: list[dict], first_fetched_ym: tuple[int, int]
+) -> list[dict]:
+    """Rows to keep as-is: US Eastern YYYY-MM strictly before the first month re-fetched from the API."""
+    if not existing:
+        return []
+    y0, m0 = first_fetched_ym
+    out: list[dict] = []
+    for r in existing:
+        ym = parse_year_month_ym(r.get("year_month") or "")
+        if ym is not None and (ym[0], ym[1]) < (y0, m0):
+            out.append(r)
+    return out
+
 
 # Branches included in export: main, master, or semver-style names (e.g. 3.6.0, v1.2.3).
 _VERSION_BRANCH = re.compile(r"^v?\d+(\.\d+)+$")
@@ -119,11 +230,20 @@ def fetch_coverage_page(org: str, repo_name: str, page: int = 1) -> dict | None:
         return None
 
 
-def fetch_all_coverage_builds(org: str, repo_name: str) -> list[dict]:
-    """Fetch build history for a repo (paginated), stopping once builds are older than MIN_BUILD_CUTOFF.
+def fetch_all_coverage_builds(
+    org: str, repo_name: str, *, oldest_eastern_ym: tuple[int, int] | None = None
+) -> list[dict]:
+    """Fetch build history for a repo (paginated), newest first.
 
-    Coveralls returns builds newest-first; we skip further pages after the first build before the cutoff.
+    Stops when a build is before the lower bound: max(MIN_BUILD_CUTOFF, first instant of
+    *oldest_eastern_ym* in US Eastern) when *oldest_eastern_ym* is set, otherwise MIN_BUILD_CUTOFF only.
+    No further pages are read once that stop triggers.
     """
+    if oldest_eastern_ym is not None:
+        oy, om = oldest_eastern_ym
+        lower_bound = max(MIN_BUILD_CUTOFF, eastern_month_start(oy, om))
+    else:
+        lower_bound = MIN_BUILD_CUTOFF
     builds = []
     page = 1
     while True:
@@ -137,7 +257,7 @@ def fetch_all_coverage_builds(org: str, repo_name: str) -> list[dict]:
             ts = parse_calculated_at(build.get("calculated_at") or "")
             if ts is None:
                 continue
-            if ts < MIN_BUILD_CUTOFF:
+            if ts < lower_bound:
                 return builds
             builds.append(build)
         total_pages = data.get("pages", 1)
@@ -412,31 +532,42 @@ def main():
 
     # Support optional org per repo, fallback to default
     org = DEFAULT_ORG
+    existing_by_repo = load_existing_repository_rows(REPO_COVERAGE_CSV)
     rows = []
     for repo in repos:
         name = repo.get("name")
         if not name:
             continue
         repo_org = repo.get("org", org)
-        print(f"Fetching {repo_org}/{name}...")
-        builds = fetch_all_coverage_builds(repo_org, name)
         program = repo.get("program", "") or ""
         project = repo.get("project", "") or ""
+        window, _latest, _cur = refresh_window_for_repo(existing_by_repo.get(name) or [])
+        if window.oldest is not None:
+            oy, om = window.oldest
+            base = existing_rows_before_month(existing_by_repo.get(name) or [], window.oldest)
+            mode = f"incremental from {oy:04d}-{om:02d}"
+        else:
+            base = []
+            mode = "full"
+        print(f"Fetching {repo_org}/{name}... ({mode})")
+        builds = fetch_all_coverage_builds(repo_org, name, oldest_eastern_ym=window.oldest)
         allowed = [b for b in builds if is_allowed_branch(b.get("branch") or "")]
         monthly = select_last_build_each_month(allowed)
         chrono = sorted(monthly, key=_sort_key_calculated_at)
-        repo_rows = [extract_row(name, b, program, project) for b in chrono]
-        with_builds = len(repo_rows)
+        from_api = [extract_row(name, b, program, project) for b in chrono]
+        with_builds = len(from_api)
+        repo_rows = base + from_api
         repo_rows = fill_repo_monthly_gaps(repo_rows)
         for row in repo_rows:
             set_repo_row_year_month(row)
         add_coverage_change_vs_prior_month(repo_rows)
         repo_rows.sort(key=_repo_row_newest_first_key, reverse=True)
         rows.extend(repo_rows)
-        if builds:
+        if builds or base:
             print(
-                f"  Retrieved {len(builds)} builds, {len(allowed)} on allowed branches, "
-                f"{with_builds} month(s) with builds -> {len(repo_rows)} rows after gap-fill"
+                f"  {len(builds)} build(s) from API, {len(allowed)} on allowed branches, "
+                f"{with_builds} month(s) in range; {len(base)} month(s) from file "
+                f"-> {len(repo_rows)} rows after gap-fill"
             )
 
     if not rows:
