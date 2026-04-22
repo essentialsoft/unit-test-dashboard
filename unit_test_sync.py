@@ -235,16 +235,20 @@ def fetch_all_coverage_builds(
 ) -> list[dict]:
     """Fetch build history for a repo (paginated), newest first.
 
-    Stops when a build is before the lower bound: max(MIN_BUILD_CUTOFF, first instant of
-    *oldest_eastern_ym* in US Eastern) when *oldest_eastern_ym* is set, otherwise MIN_BUILD_CUTOFF only.
-    No further pages are read once that stop triggers.
+    When *oldest_eastern_ym* is set, the first instant of that month (or MIN_BUILD_CUTOFF, whichever is
+    later) is the start of the range. Pagination stops as soon as a build in that month is appended:
+    the feed is newest-first, so that is the latest build in the month, which is all
+    :func:`select_last_build_each_month` needs for that month. If no such build exists, we stop at the
+    first build before that month (no append), same as not receiving any build in the month.
+
+    When *oldest_eastern_ym* is None, stop at the first build before MIN_BUILD_CUTOFF.
     """
     if oldest_eastern_ym is not None:
         oy, om = oldest_eastern_ym
-        lower_bound = max(MIN_BUILD_CUTOFF, eastern_month_start(oy, om))
+        month_start_oldest = max(MIN_BUILD_CUTOFF, eastern_month_start(oy, om))
     else:
-        lower_bound = MIN_BUILD_CUTOFF
-    builds = []
+        month_start_oldest = None
+    builds: list[dict] = []
     page = 1
     while True:
         data = fetch_coverage_page(org, repo_name, page)
@@ -257,9 +261,17 @@ def fetch_all_coverage_builds(
             ts = parse_calculated_at(build.get("calculated_at") or "")
             if ts is None:
                 continue
-            if ts < lower_bound:
+            if ts < MIN_BUILD_CUTOFF:
                 return builds
-            builds.append(build)
+            if month_start_oldest is not None:
+                if ts < month_start_oldest:
+                    return builds
+                local = ts.astimezone(_EASTERN)
+                builds.append(build)
+                if (local.year, local.month) == (oy, om):
+                    return builds
+            else:
+                builds.append(build)
         total_pages = data.get("pages", 1)
         if page >= total_pages:
             break
