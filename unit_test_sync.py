@@ -5,15 +5,22 @@ and export to CSV for dashboard import (e.g., Looker Studio).
 
 Only includes builds with calculated_at on or after 2026-01-01 in US Eastern (see MIN_BUILD_CUTOFF).
 
-Per repository, only the last build of each calendar month (US Eastern) is kept.
+Per repository, only the last build of each calendar month (US Eastern) is kept. Months with no build from
+the first month with data through the current Eastern calendar month are filled by copying the prior month's
+repo row (same metrics; calculated_at = US Eastern end of that month in UTC, or current UTC time if that
+instant is still in the future; year_month is always the filled month).
 
 coverage_change is computed per repo as (current covered_percent − previous month's), not from the API.
 
 Also writes project_coverage.csv and program_coverage.csv: one row per project / program per Eastern
 calendar month; covered_percent = sum(covered_lines) / sum(total_lines) in that bucket; coverage_change
 is MoM on that ratio.
+
+Each output CSV includes collected_at: the run date in YYYY-MM-DD (US Eastern).
 """
 
+import calendar
+import copy
 import csv
 import json
 import re
@@ -152,6 +159,8 @@ def extract_row(repo_name: str, build: dict, program: str = "", project: str = "
         "project": project,
         "full_repo": build.get("repo_name") or "",
         "branch": build.get("branch") or "",
+        # Set from calculated_at after gap-fill (US Eastern YYYY-MM).
+        "year_month": "",
         # Coveralls reports 0–100; store as 0–1 for dashboard (e.g. 82 -> 0.82).
         "covered_percent": round(num(build.get("covered_percent")) / 100, 4),
         "coverage_change": "",
@@ -177,6 +186,84 @@ def add_coverage_change_vs_prior_month(rows_oldest_first: list[dict]) -> None:
         prev = pct
 
 
+def fill_repo_monthly_gaps(repo_rows: list[dict]) -> list[dict]:
+    """Dense US Eastern month series: carry forward the previous row for months with no build.
+
+    Range is from the earliest month with data through the later of (last month with data, current Eastern month).
+    Synthetic rows use calculated_at = end of that month (US Eastern) as UTC, unless that time is still in the
+    future, in which case use current UTC time. year_month is always set to the month being filled.
+    Returns rows oldest-first (by calculated_at for ordering).
+    """
+    eastern = ZoneInfo("America/New_York")
+    if not repo_rows:
+        return []
+
+    by_ym: dict[tuple[int, int], dict] = {}
+    for row in repo_rows:
+        ts = parse_calculated_at(row.get("calculated_at") or "")
+        if ts is None:
+            continue
+        local = ts.astimezone(eastern)
+        ym = (local.year, local.month)
+        existing = by_ym.get(ym)
+        if existing is None or ts > (parse_calculated_at(existing.get("calculated_at") or "") or datetime.min.replace(tzinfo=timezone.utc)):
+            by_ym[ym] = row
+
+    if not by_ym:
+        return repo_rows
+
+    min_ym = min(by_ym.keys())
+    now_eastern = datetime.now(timezone.utc).astimezone(eastern)
+    current_ym = (now_eastern.year, now_eastern.month)
+    end_ym = max(max(by_ym.keys()), current_ym)
+
+    def next_ym(ym: tuple[int, int]) -> tuple[int, int]:
+        y, m = ym
+        if m == 12:
+            return (y + 1, 1)
+        return (y, m + 1)
+
+    def ym_le(a: tuple[int, int], b: tuple[int, int]) -> bool:
+        return (a[0], a[1]) <= (b[0], b[1])
+
+    filled: list[dict] = []
+    prev_row: dict | None = None
+    cur = min_ym
+    while ym_le(cur, end_ym):
+        if cur in by_ym:
+            prev_row = by_ym[cur]
+            filled.append(prev_row)
+        elif prev_row is not None:
+            synth = copy.deepcopy(prev_row)
+            y, m = cur
+            last_day = calendar.monthrange(y, m)[1]
+            at_end_local = datetime(y, m, last_day, 23, 59, 59, tzinfo=eastern)
+            at_end_utc = at_end_local.astimezone(timezone.utc)
+            now_utc = datetime.now(timezone.utc)
+            if at_end_utc > now_utc:
+                synth["calculated_at"] = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            else:
+                synth["calculated_at"] = at_end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            synth["year_month"] = f"{y:04d}-{m:02d}"
+            prev_row = synth
+            filled.append(synth)
+        cur = next_ym(cur)
+
+    return filled
+
+
+def set_repo_row_year_month(row: dict) -> None:
+    """US Eastern calendar month as YYYY-MM from calculated_at (gap-filled rows already set year_month)."""
+    if (row.get("year_month") or "").strip():
+        return
+    ts = parse_calculated_at(row.get("calculated_at") or "")
+    if ts is None:
+        row["year_month"] = ""
+        return
+    local = ts.astimezone(ZoneInfo("America/New_York"))
+    row["year_month"] = f"{local.year:04d}-{local.month:02d}"
+
+
 def _sort_key_calculated_at(record: dict) -> datetime:
     ts = parse_calculated_at(record.get("calculated_at") or "")
     if ts is not None:
@@ -184,20 +271,42 @@ def _sort_key_calculated_at(record: dict) -> datetime:
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
+def _repo_row_newest_first_key(row: dict) -> tuple[datetime, str]:
+    """Stable newest-first: tie-break synthetic rows that share the same calculated_at (now)."""
+    return (_sort_key_calculated_at(row), row.get("year_month") or "")
+
+
+def _repo_row_group_year_month(row: dict) -> tuple[int, int] | None:
+    """(year, month) for rollups: use repo year_month when set, else US Eastern from calculated_at."""
+    raw = (row.get("year_month") or "").strip()
+    if raw and len(raw) >= 7 and raw[4] == "-":
+        try:
+            y = int(raw[:4])
+            m = int(raw[5:7])
+            if 1 <= m <= 12:
+                return (y, m)
+        except ValueError:
+            pass
+    ts = parse_calculated_at(row.get("calculated_at") or "")
+    if ts is None:
+        return None
+    local = ts.astimezone(ZoneInfo("America/New_York"))
+    return (local.year, local.month)
+
+
 def build_project_coverage_rows(repo_rows: list[dict]) -> list[dict]:
     """Roll per-repo rows into one row per (project, US Eastern year-month).
 
     covered_percent = sum(covered_lines) / sum(total_lines). coverage_change is MoM on that ratio.
     """
-    eastern = ZoneInfo("America/New_York")
     groups: dict[tuple[str, int, int], list[dict]] = defaultdict(list)
     for row in repo_rows:
-        ts = parse_calculated_at(row.get("calculated_at") or "")
-        if ts is None:
+        ym_parts = _repo_row_group_year_month(row)
+        if ym_parts is None:
             continue
-        local = ts.astimezone(eastern)
+        y, m = ym_parts
         proj = row.get("project") or ""
-        groups[(proj, local.year, local.month)].append(row)
+        groups[(proj, y, m)].append(row)
 
     aggregated: list[dict] = []
     for (proj, y, m), bucket in groups.items():
@@ -245,15 +354,14 @@ def build_program_coverage_rows(repo_rows: list[dict]) -> list[dict]:
 
     Same aggregation as project rollup, keyed by program.
     """
-    eastern = ZoneInfo("America/New_York")
     groups: dict[tuple[str, int, int], list[dict]] = defaultdict(list)
     for row in repo_rows:
-        ts = parse_calculated_at(row.get("calculated_at") or "")
-        if ts is None:
+        ym_parts = _repo_row_group_year_month(row)
+        if ym_parts is None:
             continue
-        local = ts.astimezone(eastern)
+        y, m = ym_parts
         prog = row.get("program") or ""
-        groups[(prog, local.year, local.month)].append(row)
+        groups[(prog, y, m)].append(row)
 
     aggregated: list[dict] = []
     for (prog, y, m), bucket in groups.items():
@@ -318,18 +426,26 @@ def main():
         monthly = select_last_build_each_month(allowed)
         chrono = sorted(monthly, key=_sort_key_calculated_at)
         repo_rows = [extract_row(name, b, program, project) for b in chrono]
+        with_builds = len(repo_rows)
+        repo_rows = fill_repo_monthly_gaps(repo_rows)
+        for row in repo_rows:
+            set_repo_row_year_month(row)
         add_coverage_change_vs_prior_month(repo_rows)
-        repo_rows.sort(key=_sort_key_calculated_at, reverse=True)
+        repo_rows.sort(key=_repo_row_newest_first_key, reverse=True)
         rows.extend(repo_rows)
         if builds:
             print(
                 f"  Retrieved {len(builds)} builds, {len(allowed)} on allowed branches, "
-                f"{len(monthly)} end-of-month snapshot(s)"
+                f"{with_builds} month(s) with builds -> {len(repo_rows)} rows after gap-fill"
             )
 
     if not rows:
         print("No coverage data retrieved. Check repo names and org.")
         return
+
+    collected_at = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    for row in rows:
+        row["collected_at"] = collected_at
 
     # Write repository-level CSV
     REPO_COVERAGE_CSV.parent.mkdir(parents=True, exist_ok=True)
@@ -344,6 +460,8 @@ def main():
     # Project-level rollup (same month key and line sums as repo data)
     project_rows = build_project_coverage_rows(rows)
     if project_rows:
+        for r in project_rows:
+            r["collected_at"] = collected_at
         pf = list(project_rows[0].keys())
         with open(PROJECT_COVERAGE_CSV, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=pf)
@@ -353,6 +471,8 @@ def main():
 
     program_rows = build_program_coverage_rows(rows)
     if program_rows:
+        for r in program_rows:
+            r["collected_at"] = collected_at
         pfields = list(program_rows[0].keys())
         with open(PROGRAM_COVERAGE_CSV, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=pfields)
