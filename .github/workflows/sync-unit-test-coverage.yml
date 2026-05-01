@@ -1,0 +1,50 @@
+# Refresh coverage CSVs from Coveralls; commit updates to master.
+# Cron is UTC (e.g. adjust 02:00 UTC if you want a different local "Sunday night").
+
+name: Sync unit test coverage
+
+on:
+  schedule:
+    # 02:00 UTC every Sunday
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-unit-test-coverage
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit test sync
+        run: python unit_test_sync.py
+
+      - name: Commit and push CSV updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A data/
+          if git diff --staged --quiet; then
+            echo "No CSV changes to commit."
+          else
+            git commit -m "chore: refresh coverage CSVs from Coveralls [skip ci]"
+            git push origin master
+          fi
