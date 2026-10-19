@@ -98,18 +98,15 @@ repositories:
 - name: ccdi-cbio-site
   program: CCDI
   project: CCDI-CBIO
+- name: CCDI-C3DC-Integrated-UI
+  program: CCDI
+  project: C3DC
+- name: CCDI-Integrated-Backend
+  program: CCDI
+  project: C3DC
 - name: ccdi-cbio-core
   program: CCDI
   project: CCDI-CBIO
-- name: bento-c3dc-frontend
-  program: CCDI
-  project: C3DC
-- name: CCDI-C3DC-Backend
-  program: CCDI
-  project: C3DC
-- name: CCDI-C3DC-Dataloader
-  program: CCDI
-  project: C3DC
 - name: CCDC-WebPortal
   program: CCDI
   project: CCDC
